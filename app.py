@@ -57,18 +57,20 @@ def batch_download(symbols: list[str], period: str = "1y") -> dict[str, pd.DataF
     result = dict(cached)
 
     # Download in chunks to avoid timeouts
-    chunk_size = 20
+    chunk_size = 10  # smaller chunks to avoid rate limits on cloud
     for i in range(0, len(to_fetch), chunk_size):
         chunk = to_fetch[i:i + chunk_size]
-        try:
-            raw = yf.download(
-                " ".join(chunk),
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                progress=False,
-                threads=True,
-            )
+        for attempt in range(3):  # retry up to 3 times
+            try:
+                raw = yf.download(
+                    " ".join(chunk),
+                    period=period,
+                    interval="1d",
+                    group_by="ticker",
+                    progress=False,
+                    threads=True,
+                    timeout=30,
+                )
 
             if raw.empty:
                 continue
@@ -123,8 +125,12 @@ def batch_download(symbols: list[str], period: str = "1y") -> dict[str, pd.DataF
                 except Exception as e:
                     print(f"  Parse error {sym}: {e}")
 
-        except Exception as e:
-            print(f"Batch download error: {e}")
+            except Exception as e:
+                print(f"Batch download error (attempt {attempt+1}): {e}")
+                if attempt < 2:
+                    time.sleep(2)
+                continue
+            break  # success, no need to retry
 
     return result
 
