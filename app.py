@@ -72,65 +72,58 @@ def batch_download(symbols: list[str], period: str = "1y") -> dict[str, pd.DataF
                     timeout=30,
                 )
 
-            if raw.empty:
-                continue
+                if raw.empty:
+                    break
 
-            for sym in chunk:
-                try:
-                    # yfinance v1.2+ returns MultiIndex columns
-                    # Single: ('Price', 'Ticker') — Ticker at level 1
-                    # Multi:  ('Ticker', 'Price') — Ticker at level 0
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        # Find which level contains ticker symbols
-                        ticker_level = None
-                        for lvl_idx in range(raw.columns.nlevels):
-                            vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
-                            if sym in vals:
-                                ticker_level = lvl_idx
-                                break
-
-                        if ticker_level is not None:
-                            df = raw.xs(sym, level=ticker_level, axis=1).copy()
-                        elif len(chunk) == 1:
-                            # Single ticker — just drop the non-price level
+                for sym in chunk:
+                    try:
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            ticker_level = None
                             for lvl_idx in range(raw.columns.nlevels):
                                 vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
-                                if any(v in ["Open", "High", "Low", "Close", "Volume"] for v in vals):
+                                if sym in vals:
+                                    ticker_level = lvl_idx
+                                    break
+
+                            if ticker_level is not None:
+                                df = raw.xs(sym, level=ticker_level, axis=1).copy()
+                            elif len(chunk) == 1:
+                                for lvl_idx in range(raw.columns.nlevels):
+                                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
+                                    if any(v in ["Open", "High", "Low", "Close", "Volume"] for v in vals):
+                                        continue
+                                    df = raw.droplevel(lvl_idx, axis=1).copy()
+                                    break
+                                else:
                                     continue
-                                df = raw.droplevel(lvl_idx, axis=1).copy()
-                                break
                             else:
                                 continue
+                            df.columns = [str(c) for c in df.columns]
                         else:
+                            df = raw.copy()
+
+                        if "Close" not in df.columns:
                             continue
-                        df.columns = [str(c) for c in df.columns]
-                    else:
-                        df = raw.copy()
+                        df = df.dropna(subset=["Close"])
+                        if df.empty or len(df) < 30:
+                            continue
 
-                    # Drop NaN rows
-                    if "Close" not in df.columns:
-                        continue
-                    df = df.dropna(subset=["Close"])
-                    if df.empty or len(df) < 30:
-                        continue
+                        df = df.reset_index()
+                        date_col = [c for c in df.columns if "date" in c.lower() or "Date" in str(c)]
+                        if date_col:
+                            df = df.rename(columns={date_col[0]: "date"})
 
-                    df = df.reset_index()
-                    # Normalize date column
-                    date_col = [c for c in df.columns if "date" in c.lower() or "Date" in str(c)]
-                    if date_col:
-                        df = df.rename(columns={date_col[0]: "date"})
+                        result[sym] = df
+                        _cache[f"{sym}:{period}"] = {"data": df, "ts": now}
+                    except Exception as e:
+                        print(f"  Parse error {sym}: {e}")
 
-                    result[sym] = df
-                    _cache[f"{sym}:{period}"] = {"data": df, "ts": now}
-                except Exception as e:
-                    print(f"  Parse error {sym}: {e}")
+                break  # success, no need to retry
 
             except Exception as e:
                 print(f"Batch download error (attempt {attempt+1}): {e}")
                 if attempt < 2:
                     time.sleep(2)
-                continue
-            break  # success, no need to retry
 
     return result
 
