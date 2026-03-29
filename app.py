@@ -407,8 +407,10 @@ def start_scheduler():
 
 
 
-# Start scheduler for both gunicorn and direct run
-start_scheduler()
+# Start scheduler (only once, avoid duplicate in gunicorn workers)
+import os
+if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("GUNICORN_WORKER"):
+    start_scheduler()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", debug=False, port=5000)
