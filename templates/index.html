@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KTP Stock Scanner</title>
+    <link rel="stylesheet" href="/static/style.css?v={{ range(100000) | random }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <h1><span>KTP</span> Stock Scanner</h1>
+    <div class="header-info">TF Daily &middot; Stochastic (9,3,3) &middot; White Line + Fibonacci Recheck</div>
+</div>
+
+<!-- Category Tabs -->
+<div class="tabs">
+    {% for key, cat in categories.items() %}
+    <button class="tab {% if loop.first %}active{% endif %}" data-category="{{ key }}">
+        {{ cat.name }}<span class="count">({{ cat.symbols|length }})</span>
+    </button>
+    {% endfor %}
+    <span style="width:1px;height:24px;background:var(--border);margin:0 4px;"></span>
+    <button class="tab" data-category="simulator">Simulator</button>
+</div>
+
+<!-- Main Layout -->
+<div class="main">
+    <!-- Left: Stock List -->
+    <div class="list-panel">
+        <div class="list-toolbar">
+            <input type="text" id="search-box" class="search-box" placeholder="Search symbol...">
+        </div>
+        <div class="filter-bar">
+            <button class="filter-btn active" data-filter="all">All</button>
+            <button class="filter-btn" data-filter="uptrend">Uptrend</button>
+            <button class="filter-btn" data-filter="downtrend">Downtrend</button>
+            <button class="filter-btn" data-filter="sideway">Sideway</button>
+            <button class="filter-btn" data-filter="ready">Ready</button>
+            <button class="filter-btn" data-filter="ob">OB</button>
+            <button class="filter-btn" data-filter="os">OS</button>
+            <span class="filter-divider"></span>
+            <button class="toggle-btn" id="star-toggle">Star</button>
+            <button class="toggle-btn" id="warn-toggle">Warn</button>
+            <span class="filter-divider"></span>
+            <button class="toggle-btn" id="ticked-toggle">Ticked</button>
+            <button class="toggle-btn" id="excluded-toggle">Excluded</button>
+            <span class="filter-divider"></span>
+            <button class="sort-btn" data-sort="az">A-Z</button>
+            <button class="sort-btn" data-sort="za">Z-A</button>
+        </div>
+        <div id="loading-bar" class="loading-bar"></div>
+        <div id="stock-count" class="stock-count">Loading...</div>
+        <div id="stock-list"></div>
+    </div>
+
+    <!-- Right: Chart + Info -->
+    <div class="chart-panel">
+        <div class="chart-header">
+            <div>
+                <span id="chart-title" class="chart-title">Select a stock</span>
+                <span class="chart-subtitle">Daily &middot; Stochastic (9,3,3)</span>
+            </div>
+        </div>
+        <div class="chart-container">
+            <div id="main-chart"></div>
+            <div id="rsi-chart"></div>
+            <div id="stoch-chart"></div>
+        </div>
+        <div id="scan-info" class="scan-info">
+            <div class="empty-state" style="grid-column: 1/-1;">Click a stock to view analysis</div>
+        </div>
+    </div>
+</div>
+
+<!-- Simulator Panel (hidden by default) -->
+<div id="simulator-panel" class="simulator-panel" style="display:none;">
+    <div class="sim-header">
+        <div class="sim-stats" id="sim-stats"></div>
+        <div class="sim-controls">
+            <button class="filter-btn active" data-simfilter="all">All</button>
+            <button class="filter-btn" data-simfilter="nasdaq100">NASDAQ</button>
+            <button class="filter-btn" data-simfilter="sp500">SP500</button>
+            <button class="filter-btn" data-simfilter="set100">SET</button>
+            <button class="filter-btn" data-simfilter="thai_energy">Energy</button>
+            <span class="filter-divider"></span>
+            <button class="filter-btn" data-simfilter="open">Open</button>
+            <button class="filter-btn" data-simfilter="pending">Pending</button>
+            <button class="filter-btn" data-simfilter="closed">Closed</button>
+            <span class="filter-divider"></span>
+            <button class="sim-scan-btn" id="sim-scan-btn">Scan & Update</button>
+        </div>
+    </div>
+    <div id="sim-loading" class="loading-bar"></div>
+    <div class="sim-body">
+        <div class="sim-table-wrap">
+            <table class="sim-table">
+                <thead>
+                    <tr>
+                        <th style="width:24px;"></th>
+                        <th class="sim-sortable" data-simsort="market">Market</th>
+                        <th class="sim-sortable" data-simsort="symbol">Symbol</th>
+                        <th class="sim-sortable" data-simsort="status">Status</th>
+                        <th>Signal</th>
+                        <th>Entry</th>
+                        <th>Price</th>
+                        <th>Shares</th>
+                        <th>Invested</th>
+                        <th>SL</th>
+                        <th>TP</th>
+                        <th>Current</th>
+                        <th class="sim-sortable" data-simsort="pnl">P/L (THB)</th>
+                        <th>P/L %</th>
+                    </tr>
+                </thead>
+                <tbody id="sim-tbody"></tbody>
+            </table>
+        </div>
+        <div class="sim-chart-panel" id="sim-chart-panel">
+            <div class="chart-header">
+                <div>
+                    <span id="sim-chart-title" class="chart-title">Select a trade</span>
+                    <span class="chart-subtitle">Daily &middot; Stochastic (9,3,3)</span>
+                </div>
+            </div>
+            <div class="sim-chart-container">
+                <div id="sim-main-chart"></div>
+                <div id="sim-stoch-chart"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<script src="/static/app.js?v={{ range(100000) | random }}"></script>
+</body>
+</html>

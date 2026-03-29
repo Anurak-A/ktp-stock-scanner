@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+trades.json
+backtest_fibo_rr_result.json
+server.log
+.claude/
+*.docx
+*.jpg
