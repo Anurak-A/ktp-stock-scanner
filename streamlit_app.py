@@ -59,86 +59,94 @@ st.markdown("""
 
 # ─── Data cache ──────────────────────────────────────────────────────
 
-@st.cache_data(ttl=900, show_spinner=False)
 def batch_download(symbols_tuple, period="1y"):
     """Download daily data for multiple symbols using yf.download().
-    Uses small chunks + delays to avoid Yahoo Finance rate limits on cloud.
+    Uses single-stock downloads + delays to avoid Yahoo Finance rate limits on cloud.
+    No @st.cache_data — we manage our own cache to avoid caching empty failures.
     """
     symbols = list(symbols_tuple)
     if not symbols:
         return {}
 
+    # Check session-state cache first
+    cache_key = f"_dl_cache_{period}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = {}
+    cache = st.session_state[cache_key]
+
+    now = time.time()
     result = {}
-    chunk_size = 5  # small chunks to avoid rate limit
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i:i + chunk_size]
-        for attempt in range(5):  # more retries for cloud
+    to_fetch = []
+
+    for s in symbols:
+        cached = cache.get(s)
+        if cached and (now - cached["ts"]) < 900:  # 15 min TTL
+            result[s] = cached["data"]
+        else:
+            to_fetch.append(s)
+
+    if not to_fetch:
+        return result
+
+    # Download one stock at a time to minimize rate limit issues
+    progress = st.progress(0, text="Downloading stock data...")
+    total = len(to_fetch)
+
+    for idx, sym in enumerate(to_fetch):
+        progress.progress((idx + 1) / total, text=f"Downloading {sym} ({idx+1}/{total})...")
+
+        for attempt in range(3):
             try:
                 raw = yf.download(
-                    " ".join(chunk),
+                    sym,
                     period=period,
                     interval="1d",
-                    group_by="ticker",
                     progress=False,
-                    threads=False,  # no threading to reduce rate limit hits
-                    timeout=30,
+                    threads=False,
+                    timeout=20,
                 )
                 if raw.empty:
                     break
 
-                for sym in chunk:
-                    try:
-                        if isinstance(raw.columns, pd.MultiIndex):
-                            ticker_level = None
-                            for lvl_idx in range(raw.columns.nlevels):
-                                vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
-                                if sym in vals:
-                                    ticker_level = lvl_idx
-                                    break
+                df = raw.copy()
+                if isinstance(df.columns, pd.MultiIndex):
+                    # Drop ticker level
+                    for lvl_idx in range(df.columns.nlevels):
+                        vals = df.columns.get_level_values(lvl_idx).unique().tolist()
+                        if sym in vals or any(v not in ["Open", "High", "Low", "Close", "Volume", "Adj Close"] for v in vals):
+                            df = df.droplevel(lvl_idx, axis=1)
+                            break
+                df.columns = [str(c) for c in df.columns]
 
-                            if ticker_level is not None:
-                                df = raw.xs(sym, level=ticker_level, axis=1).copy()
-                            elif len(chunk) == 1:
-                                for lvl_idx in range(raw.columns.nlevels):
-                                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
-                                    if any(v in ["Open", "High", "Low", "Close", "Volume"] for v in vals):
-                                        continue
-                                    df = raw.droplevel(lvl_idx, axis=1).copy()
-                                    break
-                                else:
-                                    continue
-                            else:
-                                continue
-                            df.columns = [str(c) for c in df.columns]
-                        else:
-                            df = raw.copy()
+                if "Close" not in df.columns:
+                    break
+                df = df.dropna(subset=["Close"])
+                if df.empty or len(df) < 30:
+                    break
 
-                        if "Close" not in df.columns:
-                            continue
-                        df = df.dropna(subset=["Close"])
-                        if df.empty or len(df) < 30:
-                            continue
+                df = df.reset_index()
+                date_col = [c for c in df.columns if "date" in c.lower() or "Date" in str(c)]
+                if date_col:
+                    df = df.rename(columns={date_col[0]: "date"})
 
-                        df = df.reset_index()
-                        date_col = [c for c in df.columns if "date" in c.lower() or "Date" in str(c)]
-                        if date_col:
-                            df = df.rename(columns={date_col[0]: "date"})
-
-                        result[sym] = df
-                    except Exception:
-                        continue
+                result[sym] = df
+                cache[sym] = {"data": df, "ts": now}  # cache success only
                 break  # success
+
             except Exception as e:
-                wait = 3 * (attempt + 1)  # 3, 6, 9, 12, 15 sec backoff
-                if "Rate" in str(e) or "429" in str(e) or "Too Many" in str(e):
-                    wait = 10 * (attempt + 1)  # longer wait for rate limit
-                if attempt < 4:
+                err_str = str(e)
+                if "Rate" in err_str or "429" in err_str or "Too Many" in err_str:
+                    wait = 15 * (attempt + 1)  # 15, 30, 45 sec for rate limit
+                else:
+                    wait = 3 * (attempt + 1)
+                if attempt < 2:
                     time.sleep(wait)
 
-        # Delay between chunks to avoid rate limit
-        if i + chunk_size < len(symbols):
-            time.sleep(2)
+        # Small delay between stocks
+        if idx < total - 1:
+            time.sleep(1)
 
+    progress.empty()
     return result
 
 
