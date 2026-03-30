@@ -10,6 +10,8 @@ import yfinance as yf
 import pandas as pd
 
 TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades.json")
+RETRACE_TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades_retrace.json")
+RR1_TRADES_FILE = os.path.join(os.path.dirname(__file__), "trades_rr1.json")
 BUDGET_THB = 50000
 
 # ─── Exchange rate ────────────────────────────────────────────────────
@@ -42,15 +44,24 @@ def get_usdthb() -> float:
 
 # ─── Trade storage ────────────────────────────────────────────────────
 
-def load_trades() -> list:
-    if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE, "r", encoding="utf-8") as f:
+def _trades_path(mode):
+    if mode == "retrace":
+        return RETRACE_TRADES_FILE
+    if mode == "rr1":
+        return RR1_TRADES_FILE
+    return TRADES_FILE
+
+def load_trades(mode="entry") -> list:
+    path = _trades_path(mode)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return []
 
 
-def save_trades(trades: list):
-    with open(TRADES_FILE, "w", encoding="utf-8") as f:
+def save_trades(trades: list, mode="entry"):
+    path = _trades_path(mode)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(trades, f, indent=2, ensure_ascii=False)
 
 
@@ -302,8 +313,8 @@ def update_open_trades() -> dict:
 
 # ─── Summary stats ────────────────────────────────────────────────────
 
-def get_summary(category_filter: str = None) -> dict:
-    trades = load_trades()
+def get_summary(category_filter: str = None, mode="entry") -> dict:
+    trades = load_trades(mode)
 
     if category_filter and category_filter != "all":
         trades = [t for t in trades if t["category"] == category_filter]
@@ -327,3 +338,412 @@ def get_summary(category_filter: str = None) -> dict:
         "total_pnl_thb": round(total_pnl, 2),
         "total_unrealized_thb": round(total_unrealized, 2),
     }
+
+
+# ─── Retrace Simulator ──────────────────────────────────────────────
+# Entry at White Line (limit buy), TP/SL 1:1 from WL
+
+def record_retrace_signals(scan_results: dict[str, list]) -> dict:
+    """Record retrace signals: entry target = White Line, TP/SL 1:1."""
+    trades = load_trades("retrace")
+    usdthb = get_usdthb()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    active_symbols = set()
+    for t in trades:
+        if t["status"] in ("pending", "open"):
+            active_symbols.add(t["symbol"])
+
+    symbol_categories = {}
+    symbol_data = {}
+
+    for category, results in scan_results.items():
+        for r in results:
+            if r.get("is_ready_entry") and r.get("suitable", False):
+                sym = r["symbol"]
+                if sym not in symbol_categories:
+                    symbol_categories[sym] = []
+                    symbol_data[sym] = r
+                symbol_categories[sym].append(category)
+
+    new_pending = 0
+    for sym, cats in symbol_categories.items():
+        if sym in active_symbols:
+            continue
+
+        best_cat = get_best_category(sym, cats)
+        r = symbol_data[sym]
+
+        wl = r.get("white_line")
+        sl = r.get("sl_ref")
+        if not wl or not sl:
+            continue
+
+        # TP/SL 1:1 from White Line
+        sl_dist = abs(wl - sl)
+        tp = wl + sl_dist * 1.0
+
+        trade = {
+            "symbol": sym,
+            "category": best_cat,
+            "signal_date": today,
+            "entry_date": None,
+            "entry_price": None,
+            "entry_target": round(wl, 4),  # limit buy at WL
+            "shares": 0,
+            "budget_thb": BUDGET_THB,
+            "sl": round(sl, 4),
+            "tp": round(tp, 4),
+            "white_line": round(wl, 4),
+            "signal_close": r.get("close"),
+            "is_thai": is_thai_stock(sym),
+            "usdthb_at_signal": usdthb,
+            "status": "pending",
+            "close_date": None,
+            "close_price": None,
+            "pnl": None,
+            "pnl_thb": None,
+        }
+        trades.append(trade)
+        new_pending += 1
+
+    save_trades(trades, "retrace")
+    return {"new_pending": new_pending, "total_active": len(active_symbols) + new_pending}
+
+
+def fill_retrace_trades() -> dict:
+    """Fill pending retrace trades when price drops to WL (entry_target)."""
+    trades = load_trades("retrace")
+    usdthb = get_usdthb()
+    filled = 0
+
+    for trade in trades:
+        if trade["status"] != "pending":
+            continue
+
+        sym = trade["symbol"]
+        target = trade.get("entry_target")
+        if not target:
+            continue
+
+        try:
+            raw = yf.download(sym, period="10d", interval="1d", progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                for lvl_idx in range(raw.columns.nlevels):
+                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
+                    if sym in vals:
+                        raw = raw.xs(sym, level=lvl_idx, axis=1)
+                        break
+                else:
+                    raw = raw.droplevel(1, axis=1) if raw.columns.nlevels > 1 else raw
+            raw.columns = [str(c) for c in raw.columns]
+
+            if raw.empty or "Low" not in raw.columns:
+                continue
+
+            signal_date = pd.Timestamp(trade["signal_date"])
+            future_bars = raw[raw.index > signal_date]
+
+            for idx, bar in future_bars.iterrows():
+                low = float(bar["Low"])
+                # Price dropped to WL → fill at WL
+                if low <= target:
+                    thai = trade.get("is_thai", is_thai_stock(sym))
+                    shares = calc_shares(target, thai, usdthb)
+                    if shares < 1:
+                        trade["status"] = "skipped"
+                        break
+
+                    trade["entry_date"] = idx.strftime("%Y-%m-%d")
+                    trade["entry_price"] = round(target, 4)
+                    trade["shares"] = shares
+                    trade["usdthb_at_entry"] = usdthb
+                    trade["status"] = "open"
+                    filled += 1
+                    break
+
+            # Skip if no fill within 5 trading days
+            if trade["status"] == "pending" and len(future_bars) >= 5:
+                trade["status"] = "skipped"
+
+        except Exception as e:
+            print(f"  Retrace fill error {sym}: {e}")
+
+    save_trades(trades, "retrace")
+    return {"filled": filled}
+
+
+def update_retrace_trades() -> dict:
+    """Check TP/SL for open retrace trades."""
+    trades = load_trades("retrace")
+    usdthb = get_usdthb()
+    closed = 0
+
+    open_trades = [t for t in trades if t["status"] == "open"]
+    if not open_trades:
+        return {"closed": 0}
+
+    for trade in open_trades:
+        sym = trade["symbol"]
+        tp = trade.get("tp")
+        sl = trade.get("sl")
+        entry_price = trade["entry_price"]
+
+        if not tp or not sl:
+            continue
+
+        try:
+            raw = yf.download(sym, period="10d", interval="1d", progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                for lvl_idx in range(raw.columns.nlevels):
+                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
+                    if sym in vals:
+                        raw = raw.xs(sym, level=lvl_idx, axis=1)
+                        break
+                else:
+                    raw = raw.droplevel(1, axis=1) if raw.columns.nlevels > 1 else raw
+            raw.columns = [str(c) for c in raw.columns]
+
+            if raw.empty:
+                continue
+
+            entry_date = pd.Timestamp(trade["entry_date"])
+            bars_after = raw[raw.index >= entry_date]
+
+            for idx, bar in bars_after.iterrows():
+                high = float(bar["High"])
+                low = float(bar["Low"])
+
+                if low <= sl:
+                    trade["status"] = "sl_hit"
+                    trade["close_price"] = round(sl, 4)
+                    trade["close_date"] = idx.strftime("%Y-%m-%d")
+                    pnl = (sl - entry_price) * trade["shares"]
+                    trade["pnl"] = round(pnl, 2)
+                    trade["pnl_thb"] = round(pnl if trade.get("is_thai") else pnl * usdthb, 2)
+                    closed += 1
+                    break
+
+                if high >= tp:
+                    trade["status"] = "tp_hit"
+                    trade["close_price"] = round(tp, 4)
+                    trade["close_date"] = idx.strftime("%Y-%m-%d")
+                    pnl = (tp - entry_price) * trade["shares"]
+                    trade["pnl"] = round(pnl, 2)
+                    trade["pnl_thb"] = round(pnl if trade.get("is_thai") else pnl * usdthb, 2)
+                    closed += 1
+                    break
+
+            if trade["status"] == "open":
+                last_close = float(raw.iloc[-1]["Close"])
+                trade["current_price"] = round(last_close, 4)
+                unrealized = (last_close - entry_price) * trade["shares"]
+                trade["unrealized_thb"] = round(unrealized if trade.get("is_thai") else unrealized * usdthb, 2)
+
+        except Exception as e:
+            print(f"  Retrace update error {sym}: {e}")
+
+    save_trades(trades, "retrace")
+    return {"closed": closed}
+
+
+# ─── RR1 Simulator ───────────────────────────────────────────────────
+# Same TP/SL as Entry Now, but entry at midpoint (TP+SL)/2 → R:R 1:1
+
+def record_rr1_signals(scan_results: dict[str, list]) -> dict:
+    """Record RR1 signals: entry at midpoint of TP/SL from Entry Now."""
+    trades = load_trades("rr1")
+    usdthb = get_usdthb()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    active_symbols = set()
+    for t in trades:
+        if t["status"] in ("pending", "open"):
+            active_symbols.add(t["symbol"])
+
+    symbol_categories = {}
+    symbol_data = {}
+
+    for category, results in scan_results.items():
+        for r in results:
+            if r.get("is_ready_entry") and r.get("suitable", False):
+                sym = r["symbol"]
+                if sym not in symbol_categories:
+                    symbol_categories[sym] = []
+                    symbol_data[sym] = r
+                symbol_categories[sym].append(category)
+
+    new_pending = 0
+    for sym, cats in symbol_categories.items():
+        if sym in active_symbols:
+            continue
+
+        best_cat = get_best_category(sym, cats)
+        r = symbol_data[sym]
+
+        tp = r.get("tp_ref")
+        sl = r.get("sl_ref")
+        if not tp or not sl:
+            continue
+
+        # Entry target = midpoint between TP and SL → R:R 1:1
+        entry_target = (tp + sl) / 2
+
+        trade = {
+            "symbol": sym,
+            "category": best_cat,
+            "signal_date": today,
+            "entry_date": None,
+            "entry_price": None,
+            "entry_target": round(entry_target, 4),
+            "shares": 0,
+            "budget_thb": BUDGET_THB,
+            "sl": round(sl, 4),
+            "tp": round(tp, 4),
+            "signal_close": r.get("close"),
+            "is_thai": is_thai_stock(sym),
+            "usdthb_at_signal": usdthb,
+            "status": "pending",
+            "close_date": None,
+            "close_price": None,
+            "pnl": None,
+            "pnl_thb": None,
+        }
+        trades.append(trade)
+        new_pending += 1
+
+    save_trades(trades, "rr1")
+    return {"new_pending": new_pending, "total_active": len(active_symbols) + new_pending}
+
+
+def fill_rr1_trades() -> dict:
+    """Fill pending RR1 trades when price drops to entry_target."""
+    trades = load_trades("rr1")
+    usdthb = get_usdthb()
+    filled = 0
+
+    for trade in trades:
+        if trade["status"] != "pending":
+            continue
+
+        sym = trade["symbol"]
+        target = trade.get("entry_target")
+        if not target:
+            continue
+
+        try:
+            raw = yf.download(sym, period="10d", interval="1d", progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                for lvl_idx in range(raw.columns.nlevels):
+                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
+                    if sym in vals:
+                        raw = raw.xs(sym, level=lvl_idx, axis=1)
+                        break
+                else:
+                    raw = raw.droplevel(1, axis=1) if raw.columns.nlevels > 1 else raw
+            raw.columns = [str(c) for c in raw.columns]
+
+            if raw.empty or "Low" not in raw.columns:
+                continue
+
+            signal_date = pd.Timestamp(trade["signal_date"])
+            future_bars = raw[raw.index > signal_date]
+
+            for idx, bar in future_bars.iterrows():
+                low = float(bar["Low"])
+                if low <= target:
+                    thai = trade.get("is_thai", is_thai_stock(sym))
+                    shares = calc_shares(target, thai, usdthb)
+                    if shares < 1:
+                        trade["status"] = "skipped"
+                        break
+
+                    trade["entry_date"] = idx.strftime("%Y-%m-%d")
+                    trade["entry_price"] = round(target, 4)
+                    trade["shares"] = shares
+                    trade["usdthb_at_entry"] = usdthb
+                    trade["status"] = "open"
+                    filled += 1
+                    break
+
+            if trade["status"] == "pending" and len(future_bars) >= 5:
+                trade["status"] = "skipped"
+
+        except Exception as e:
+            print(f"  RR1 fill error {sym}: {e}")
+
+    save_trades(trades, "rr1")
+    return {"filled": filled}
+
+
+def update_rr1_trades() -> dict:
+    """Check TP/SL for open RR1 trades."""
+    trades = load_trades("rr1")
+    usdthb = get_usdthb()
+    closed = 0
+
+    open_trades = [t for t in trades if t["status"] == "open"]
+    if not open_trades:
+        return {"closed": 0}
+
+    for trade in open_trades:
+        sym = trade["symbol"]
+        tp = trade.get("tp")
+        sl = trade.get("sl")
+        entry_price = trade["entry_price"]
+        if not tp or not sl:
+            continue
+
+        try:
+            raw = yf.download(sym, period="10d", interval="1d", progress=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                for lvl_idx in range(raw.columns.nlevels):
+                    vals = raw.columns.get_level_values(lvl_idx).unique().tolist()
+                    if sym in vals:
+                        raw = raw.xs(sym, level=lvl_idx, axis=1)
+                        break
+                else:
+                    raw = raw.droplevel(1, axis=1) if raw.columns.nlevels > 1 else raw
+            raw.columns = [str(c) for c in raw.columns]
+
+            if raw.empty:
+                continue
+
+            entry_date = pd.Timestamp(trade["entry_date"])
+            bars_after = raw[raw.index >= entry_date]
+
+            for idx, bar in bars_after.iterrows():
+                high = float(bar["High"])
+                low = float(bar["Low"])
+
+                if low <= sl:
+                    trade["status"] = "sl_hit"
+                    trade["close_price"] = round(sl, 4)
+                    trade["close_date"] = idx.strftime("%Y-%m-%d")
+                    pnl = (sl - entry_price) * trade["shares"]
+                    trade["pnl"] = round(pnl, 2)
+                    trade["pnl_thb"] = round(pnl if trade.get("is_thai") else pnl * usdthb, 2)
+                    closed += 1
+                    break
+
+                if high >= tp:
+                    trade["status"] = "tp_hit"
+                    trade["close_price"] = round(tp, 4)
+                    trade["close_date"] = idx.strftime("%Y-%m-%d")
+                    pnl = (tp - entry_price) * trade["shares"]
+                    trade["pnl"] = round(pnl, 2)
+                    trade["pnl_thb"] = round(pnl if trade.get("is_thai") else pnl * usdthb, 2)
+                    closed += 1
+                    break
+
+            if trade["status"] == "open":
+                last_close = float(raw.iloc[-1]["Close"])
+                trade["current_price"] = round(last_close, 4)
+                unrealized = (last_close - entry_price) * trade["shares"]
+                trade["unrealized_thb"] = round(unrealized if trade.get("is_thai") else unrealized * usdthb, 2)
+
+        except Exception as e:
+            print(f"  RR1 update error {sym}: {e}")
+
+    save_trades(trades, "rr1")
+    return {"closed": closed}

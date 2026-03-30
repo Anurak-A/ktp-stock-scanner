@@ -13,6 +13,8 @@ from scanner import scan_stock, calc_stochastic, calc_rsi
 from stocks import ALL_CATEGORIES
 from simulator import (
     record_ready_signals, fill_pending_trades, update_open_trades,
+    record_retrace_signals, fill_retrace_trades, update_retrace_trades,
+    record_rr1_signals, fill_rr1_trades, update_rr1_trades,
     load_trades, get_summary, get_usdthb, BUDGET_THB
 )
 
@@ -274,9 +276,8 @@ def api_chart(symbol):
 
 # ─── Simulator API ────────────────────────────────────────────────────
 
-@app.route("/api/simulator/scan")
-def api_simulator_scan():
-    """Scan all categories for Ready to Entry signals and record them."""
+def _run_full_scan():
+    """Scan once, return scan_results for all categories."""
     scan_results = {}
     for cat_key, cat_info in ALL_CATEGORIES.items():
         symbols = list(dict.fromkeys(cat_info["symbols"]))
@@ -299,19 +300,33 @@ def api_simulator_scan():
             except Exception:
                 continue
         scan_results[cat_key] = results
+    return scan_results
 
-    # Record new ready signals
-    record_result = record_ready_signals(scan_results)
-    # Fill pending trades with next day open
-    fill_result = fill_pending_trades()
-    # Update open trades (TP/SL check)
-    update_result = update_open_trades()
 
-    return jsonify({
-        **record_result,
-        **fill_result,
-        **update_result,
-    })
+_last_scan_results = None
+
+def _scan_all_modes(scan_results=None):
+    """Record + fill + update all 3 modes from same scan results."""
+    if scan_results is None:
+        scan_results = _run_full_scan()
+    # All 3 modes get identical signals
+    r1 = record_ready_signals(scan_results)
+    record_retrace_signals(scan_results)
+    record_rr1_signals(scan_results)
+    # Fill + update each mode
+    r2 = fill_pending_trades()
+    fill_retrace_trades()
+    fill_rr1_trades()
+    r3 = update_open_trades()
+    update_retrace_trades()
+    update_rr1_trades()
+    return {**r1, **r2, **r3}
+
+
+@app.route("/api/simulator/scan")
+def api_simulator_scan():
+    """Scan all categories and record signals for ALL 3 modes at once."""
+    return jsonify(_scan_all_modes())
 
 
 @app.route("/api/simulator/trades")
@@ -334,7 +349,66 @@ def api_simulator_trades():
 def api_simulator_summary():
     """Get summary stats."""
     category = request.args.get("category", "all")
-    summary = get_summary(category)
+    mode = request.args.get("mode", "entry")
+    summary = get_summary(category, mode)
+    summary["budget_per_trade"] = BUDGET_THB
+    summary["usdthb"] = get_usdthb()
+    return jsonify(summary)
+
+
+# ─── Retrace Simulator API ───────────────────────────────────────────
+
+@app.route("/api/simulator/retrace/scan")
+def api_retrace_scan():
+    """Scan for retrace signals (shared scan with all modes)."""
+    return jsonify(_scan_all_modes())
+
+
+@app.route("/api/simulator/retrace/trades")
+def api_retrace_trades():
+    """Get retrace trades."""
+    category = request.args.get("category", "all")
+    trades = load_trades("retrace")
+    if category and category != "all":
+        trades = [t for t in trades if t["category"] == category]
+    status_order = {"open": 0, "pending": 1, "tp_hit": 2, "sl_hit": 3, "skipped": 4}
+    trades.sort(key=lambda t: (status_order.get(t["status"], 9), t.get("entry_date") or "9999"))
+    return jsonify(trades)
+
+
+@app.route("/api/simulator/retrace/summary")
+def api_retrace_summary():
+    """Get retrace summary."""
+    category = request.args.get("category", "all")
+    summary = get_summary(category, "retrace")
+    summary["budget_per_trade"] = BUDGET_THB
+    summary["usdthb"] = get_usdthb()
+    return jsonify(summary)
+
+
+# ─── RR1 Simulator API ───────────────────────────────────────────────
+
+@app.route("/api/simulator/rr1/scan")
+def api_rr1_scan():
+    """Scan for RR1 signals (shared scan with all modes)."""
+    return jsonify(_scan_all_modes())
+
+
+@app.route("/api/simulator/rr1/trades")
+def api_rr1_trades():
+    category = request.args.get("category", "all")
+    trades = load_trades("rr1")
+    if category and category != "all":
+        trades = [t for t in trades if t["category"] == category]
+    status_order = {"open": 0, "pending": 1, "tp_hit": 2, "sl_hit": 3, "skipped": 4}
+    trades.sort(key=lambda t: (status_order.get(t["status"], 9), t.get("entry_date") or "9999"))
+    return jsonify(trades)
+
+
+@app.route("/api/simulator/rr1/summary")
+def api_rr1_summary():
+    category = request.args.get("category", "all")
+    summary = get_summary(category, "rr1")
     summary["budget_per_trade"] = BUDGET_THB
     summary["usdthb"] = get_usdthb()
     return jsonify(summary)
@@ -412,4 +486,4 @@ if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not os.environ.get("GUNICORN
     start_scheduler()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=False, port=5000)
+    app.run(host="0.0.0.0", debug=False, port=1010)
