@@ -19,27 +19,30 @@ BUDGET_THB = 50000
 _usdthb_cache = {"rate": None, "ts": 0}
 
 def get_usdthb() -> float:
-    """Get current USD/THB rate. Cache for 1 hour."""
+    """Get current USD/THB rate. Cache for 6 hours to reduce API calls."""
     import time
     now = time.time()
-    if _usdthb_cache["rate"] and (now - _usdthb_cache["ts"]) < 3600:
+    if _usdthb_cache["rate"] and (now - _usdthb_cache["ts"]) < 21600:
         return _usdthb_cache["rate"]
-    try:
-        tk = yf.download("USDTHB=X", period="5d", interval="1d", progress=False)
-        if isinstance(tk.columns, pd.MultiIndex):
-            # Find and drop the ticker level, keep price level
-            for lvl_idx in range(tk.columns.nlevels):
-                vals = tk.columns.get_level_values(lvl_idx).unique().tolist()
-                if "USDTHB=X" in vals:
-                    tk = tk.droplevel(lvl_idx, axis=1)
-                    break
-            tk.columns = [str(c) for c in tk.columns]
-        rate = float(tk["Close"].dropna().iloc[-1])
-        _usdthb_cache["rate"] = rate
-        _usdthb_cache["ts"] = now
-        return rate
-    except Exception:
-        return 34.0  # fallback
+    for attempt in range(3):
+        try:
+            tk = yf.download("USDTHB=X", period="5d", interval="1d",
+                             progress=False, threads=False, timeout=15)
+            if isinstance(tk.columns, pd.MultiIndex):
+                for lvl_idx in range(tk.columns.nlevels):
+                    vals = tk.columns.get_level_values(lvl_idx).unique().tolist()
+                    if "USDTHB=X" in vals:
+                        tk = tk.droplevel(lvl_idx, axis=1)
+                        break
+                tk.columns = [str(c) for c in tk.columns]
+            rate = float(tk["Close"].dropna().iloc[-1])
+            _usdthb_cache["rate"] = rate
+            _usdthb_cache["ts"] = now
+            return rate
+        except Exception:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+    return _usdthb_cache.get("rate") or 34.0  # fallback
 
 
 # ─── Trade storage ────────────────────────────────────────────────────

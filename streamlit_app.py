@@ -59,18 +59,20 @@ st.markdown("""
 
 # ─── Data cache ──────────────────────────────────────────────────────
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def batch_download(symbols_tuple, period="1y"):
-    """Download daily data for multiple symbols using yf.download()."""
+    """Download daily data for multiple symbols using yf.download().
+    Uses small chunks + delays to avoid Yahoo Finance rate limits on cloud.
+    """
     symbols = list(symbols_tuple)
     if not symbols:
         return {}
 
     result = {}
-    chunk_size = 10
+    chunk_size = 5  # small chunks to avoid rate limit
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
-        for attempt in range(3):
+        for attempt in range(5):  # more retries for cloud
             try:
                 raw = yf.download(
                     " ".join(chunk),
@@ -78,7 +80,7 @@ def batch_download(symbols_tuple, period="1y"):
                     interval="1d",
                     group_by="ticker",
                     progress=False,
-                    threads=True,
+                    threads=False,  # no threading to reduce rate limit hits
                     timeout=30,
                 )
                 if raw.empty:
@@ -125,10 +127,17 @@ def batch_download(symbols_tuple, period="1y"):
                         result[sym] = df
                     except Exception:
                         continue
-                break
-            except Exception:
-                if attempt < 2:
-                    time.sleep(2)
+                break  # success
+            except Exception as e:
+                wait = 3 * (attempt + 1)  # 3, 6, 9, 12, 15 sec backoff
+                if "Rate" in str(e) or "429" in str(e) or "Too Many" in str(e):
+                    wait = 10 * (attempt + 1)  # longer wait for rate limit
+                if attempt < 4:
+                    time.sleep(wait)
+
+        # Delay between chunks to avoid rate limit
+        if i + chunk_size < len(symbols):
+            time.sleep(2)
 
     return result
 
