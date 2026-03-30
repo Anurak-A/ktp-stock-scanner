@@ -600,6 +600,12 @@ def render_sim_mode(mode):
     # ── Scan button ──
     if st.button(f"🔄 Scan & Update ({mode_label})", key=f"btn_sim_scan_{mode}"):
         with st.spinner("Scanning all categories and updating trades..."):
+            # Fetch USDTHB once and cache in session
+            try:
+                st.session_state["cached_usdthb"] = get_usdthb()
+            except Exception:
+                pass
+
             scan_results = _run_full_scan_cached()
 
             if mode == "entry":
@@ -617,9 +623,10 @@ def render_sim_mode(mode):
 
             st.success("Scan complete!")
 
-    # ── Summary stats ──
+    # ── Summary stats (no API calls on page load) ──
     summary = get_summary(mode=mode)
-    usdthb = get_usdthb()
+    # Use cached USDTHB or fallback — don't call Yahoo on every page render
+    usdthb = st.session_state.get("cached_usdthb", 34.0)
 
     stat_cols = st.columns(8)
     with stat_cols[0]:
